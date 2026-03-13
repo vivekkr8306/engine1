@@ -18,13 +18,12 @@ import UPNG from 'upng-js';
 // ============================================================
 
 const MODEL_URL =
-"https://huggingface.co/anton96vice/mobileclip2_tflite/resolve/main/mobileclip_s1_datacompdr_last.tflite";
-
-const MODEL_FILENAME = "mobileclip_s1.tflite";
+"https://cdn-lfs.huggingface.co/repos/3f/9b/3f9b1f0f7a5f5b4e2e0d7c1c6c4f2e6f7c5b6f7a/mobileclip_s0_int8.tflite";
+const MODEL_FILENAME = 'mobileclip_s0.tflite';
 const FS_MODEL_PATH  = `${documentDirectory}models/${MODEL_FILENAME}`;
 
 // CLIP preprocessing constants
-const IMAGE_SIZE = 256;
+const IMAGE_SIZE = 224;
 const CLIP_MEAN  = [0.48145466, 0.4578275,  0.40821073];
 const CLIP_STD   = [0.26862954, 0.26130258, 0.27577711];
 
