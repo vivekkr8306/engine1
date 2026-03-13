@@ -1,260 +1,256 @@
+import { loadTensorflowModel, TensorflowModel } from 'react-native-nitro-tflite';
+import * as ImageManipulator from 'expo-image-manipulator';
 import {
-    env,
-    AutoProcessor,
-    SiglipVisionModel,
-    AutoTokenizer,
-    SiglipTextModel
-} from '@xenova/transformers';
+  documentDirectory,
+  makeDirectoryAsync,
+  getInfoAsync,
+  downloadAsync,
+  deleteAsync
+} from 'expo-file-system/legacy';
+import UPNG from 'upng-js';
 
-import { documentDirectory, makeDirectoryAsync, getInfoAsync, downloadAsync } from 'expo-file-system/legacy';
+// ============================================================
+// MODEL CONFIG
+//
+// MobileCLIP S2 — smallest quantized CLIP variant for mobile
+// Image + text embeddings share same 512-dim vector space
+// Source: https://huggingface.co/anton96vice/mobileclip2_tflite
+// ============================================================
+
+const MODEL_URL =
+"https://huggingface.co/anton96vice/mobileclip2_tflite/resolve/main/mobileclip_s1_datacompdr_last.tflite";
+
+const MODEL_FILENAME = "mobileclip_s1.tflite";
+const FS_MODEL_PATH  = `${documentDirectory}models/${MODEL_FILENAME}`;
+
+// CLIP preprocessing constants
+const IMAGE_SIZE = 256;
+const CLIP_MEAN  = [0.48145466, 0.4578275,  0.40821073];
+const CLIP_STD   = [0.26862954, 0.26130258, 0.27577711];
+
+// Text constants
+const CONTEXT_LENGTH = 77;
+const BOS_TOKEN      = 49406;
+const EOS_TOKEN      = 49407;
 
 
+// ============================================================
+// MODEL SINGLETON
+// ============================================================
 
-// Mobile Configuration:
-// Configure Transformers to strictly use local files only
-env.allowRemoteModels = false; // CRITICAL: Prevent fetch() downloads through JS bridge
-env.allowLocalModels = true; // Allow loading from disk
-env.localModelPath = documentDirectory + 'models/';
-env.useBrowserCache = false;
-
-// Aggressive mobile memory configuration
-env.backends.onnx.wasm.numThreads = 1; // Single thread to reduce memory
-env.backends.onnx.wasm.wasmPaths = {}; // Let it auto-detect
-env.backends.onnx.wasm.initTimeout = 30000; // 30 second timeout
-
-// Disable progress callbacks that can send binary data chunks to JS
-env.backends.onnx.logLevel = 'error'; // Only log errors, not progress
-
-// Model configuration for CLIP patch16 (smaller model)
-const MODEL_NAME = 'Xenova/clip-vit-base-patch16';
-const MODEL_BASE_URL = 'https://huggingface.co/Xenova/clip-vit-base-patch16/resolve/main';
-
-// Files needed for the CLIP model (pre-download these to avoid JS bridge)
-const MODEL_FILES = [
-    'onnx/model_quantized.onnx',
-    'tokenizer.json',
-    'preprocessor_config.json',
-    'config.json',
-    'special_tokens_map.json',
-    'tokenizer_config.json'
-];
-
-const MODEL_DIR = documentDirectory + 'models/' + MODEL_NAME + '/';
-
-// Singleton variables to keep models in memory after loading
-let processor: any = null;
-let visionModel: any = null;
-let tokenizer: any = null;
-let textModel: any = null;
+let model: TensorflowModel | null = null;
 let isInitialized = false;
-let memoryWarningShown = false;
 
-/**
- * The Critical Math Fix: L2 Normalization
- * Forces the vector into a standard coordinate space so distances compare correctly.
- */
-export function normalizeVector(array: Float32Array): Float32Array {
-    let sum = 0;
-    for (let i = 0; i < array.length; i++) {
-        sum += array[i] * array[i];
-    }
-    const magnitude = Math.sqrt(sum);
-    
-    // Prevent division by zero
-    if (magnitude === 0) return array;
-    
-    for (let i = 0; i < array.length; i++) {
-        array[i] /= magnitude;
-    }
-    return array;
+
+// ============================================================
+// VECTOR UTILS
+// ============================================================
+
+export function normalizeVector(v: Float32Array): Float32Array {
+  let sum = 0;
+  for (let i = 0; i < v.length; i++) sum += v[i] * v[i];
+  const mag = Math.sqrt(sum);
+  if (mag === 0) return v;
+  for (let i = 0; i < v.length; i++) v[i] /= mag;
+  return v;
 }
 
-/**
- * Pre-computes the Dot Product (Cosine Similarity) of two already L2-normalized vectors in pure JS 
- */
-export function cosineSimilarity(vecA: Float32Array, vecB: Float32Array): number {
-    let dotProduct = 0;
-    const len = Math.min(vecA.length, vecB.length);
-    for (let i = 0; i < len; i++) {
-        dotProduct += vecA[i] * vecB[i];
-    }
-    return dotProduct;
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) dot += a[i] * b[i];
+  return dot;
 }
 
-/**
- * Downloads and caches the AI models on the device.
- * Takes a callback to update the loading screen UI.
- * 
- * IMPORTANT: Make sure to disable network inspection in React Native Dev Menu
- * to prevent Base64 encoding of large downloads that causes OOM crashes.
- */
-export async function checkAndDownloadModels(onProgress: (status: string) => void): Promise<void> {
-    try {
-        if (isInitialized) {
-            onProgress('Models already loaded!');
-            return;
-        }
 
-        onProgress('Checking model files...');
+// ============================================================
+// DOWNLOAD + LOAD MODEL
+// ============================================================
 
-        // Ensure model directory exists
-        await makeDirectoryAsync(MODEL_DIR, { intermediates: true });
+export async function checkAndDownloadModels(
+  onProgress: (msg: string) => void
+): Promise<void> {
 
-        // Check which files need to be downloaded
-        const filesToDownload: string[] = [];
-        for (const file of MODEL_FILES) {
-            const localPath = MODEL_DIR + file;
-            const fileInfo = await getInfoAsync(localPath);
-            if (!fileInfo.exists) {
-                filesToDownload.push(file);
-            }
-        }
+  if (isInitialized) {
+    onProgress('Model already initialized');
+    return;
+  }
 
-        if (filesToDownload.length > 0) {
-            onProgress(`Downloading ${filesToDownload.length} model files natively...`);
+  try {
 
-            // Download files one by one using native FileSystem (bypasses JS bridge)
-            for (let i = 0; i < filesToDownload.length; i++) {
-                const file = filesToDownload[i];
-                const remoteUrl = MODEL_BASE_URL + '/' + file;
-                const localPath = MODEL_DIR + file;
+    // 1. Ensure directory exists
+    await makeDirectoryAsync(`${documentDirectory}models/`, { intermediates: true });
 
-                onProgress(`Downloading ${file} (${i + 1}/${filesToDownload.length})...`);
-                console.log(`Downloading ${file} from ${remoteUrl} to ${localPath}`);
+    // 2. Download model if missing
+    const info = await getInfoAsync(FS_MODEL_PATH);
+    const size  = (info as any).size ?? 0;
 
-                const downloadResult = await downloadAsync(remoteUrl, localPath);
-                console.log(`✅ Downloaded ${file} (${downloadResult.status})`);
-            }
-
-            onProgress('All model files downloaded successfully!');
-        } else {
-            onProgress('All model files already exist locally.');
-        }
-
-        // Now load the models from local files (no network calls)
-        onProgress('Initializing AI models from local files...');
-
-        // Load models one by one with memory cleanup between loads
-        onProgress('Loading Vision Processor...');
-        processor = await loadModelWithRetry(
-            () => AutoProcessor.from_pretrained(MODEL_NAME),
-            'Vision Processor'
-        );
-
-        await cleanupMemory();
-
-        onProgress('Loading Vision Model...');
-        visionModel = await loadModelWithRetry(
-            () => SiglipVisionModel.from_pretrained(MODEL_NAME, {
-                quantized: true,
-            }),
-            'Vision Model'
-        );
-
-        await cleanupMemory();
-
-        onProgress('Loading Text Tokenizer...');
-        tokenizer = await loadModelWithRetry(
-            () => AutoTokenizer.from_pretrained(MODEL_NAME),
-            'Text Tokenizer'
-        );
-
-        await cleanupMemory();
-
-        onProgress('Loading Text Model...');
-        textModel = await loadModelWithRetry(
-            () => SiglipTextModel.from_pretrained(MODEL_NAME, {
-                quantized: true,
-            }),
-            'Text Model'
-        );
-
-        await cleanupMemory();
-        isInitialized = true;
-        onProgress('All models ready!');
-        console.log("✅ Models loaded into memory from local files.");
-    } catch (error) {
-        console.error("❌ Model loading failed:", error);
-        onProgress('Error loading AI models.');
-        // Clean up any partially loaded models
-        cleanupModels();
-        throw error;
+    if (info.exists && (info.size ?? 0) < 10000000) {
+        console.log("Corrupted model detected. Deleting...");
+        await deleteAsync(FS_MODEL_PATH, { idempotent: true });
     }
+
+    if (!info.exists || size === 0) {
+      onProgress('Downloading MobileCLIP model (~30MB)...');
+      console.log(`[download] ${MODEL_URL} → ${FS_MODEL_PATH}`);
+
+      const res = await downloadAsync(MODEL_URL, FS_MODEL_PATH);
+
+      if (res.status !== 200) {
+        throw new Error(`Download failed: HTTP ${res.status}`);
+      }
+
+      const verify     = await getInfoAsync(FS_MODEL_PATH);
+      const verifiedSize = (verify as any).size ?? 0;
+      if (!verify.exists || verifiedSize === 0) {
+        throw new Error('Model file is empty after download');
+      }
+      console.log(`✅ Model downloaded (${verifiedSize} bytes)`);
+    } else {
+      console.log(`[check] Model already exists (${size} bytes)`);
+    }
+
+    // 3. Load model
+    // react-native-nitro-tflite accepts file:// URI directly
+    onProgress('Loading model...');
+    model = await loadTensorflowModel({ url: FS_MODEL_PATH }, 'default');
+
+    // Log tensor info so we know exact input/output indices
+    console.log('✅ Model loaded');
+    console.log('   inputs:',  model.inputs.map((t, i)  => `[${i}] ${t.name} ${JSON.stringify(t.shape)} ${t.dataType}`));
+    console.log('   outputs:', model.outputs.map((t, i) => `[${i}] ${t.name} ${JSON.stringify(t.shape)} ${t.dataType}`));
+
+    isInitialized = true;
+    onProgress('Model ready!');
+
+  } catch (err) {
+    console.error('❌ Model loading failed:', err);
+    cleanupModels();
+    throw err;
+  }
 }
 
-/**
- * Returns the cached model instances for the ingestion and retrieval pipelines.
- */
-export async function getModels() {
-    if (!isInitialized || !processor || !visionModel || !tokenizer || !textModel) {
-        throw new Error("Models are not loaded yet. Call checkAndDownloadModels first.");
+
+// ============================================================
+// IMAGE EMBEDDING
+// imageUri → normalized Float32Array [512]
+//
+// API: model.runSync([tensor0, tensor1, ...]) → TypedArray[]
+// Inputs are passed as a flat array in input index order.
+// ============================================================
+
+export async function getImageEmbedding(imageUri: string): Promise<Float32Array> {
+
+  if (!model) throw new Error('Model not loaded. Call checkAndDownloadModels first.');
+
+  // 1. Resize to 256×256, export as PNG with base64
+  const resized = await ImageManipulator.manipulateAsync(
+    imageUri,
+    [{ resize: { width: IMAGE_SIZE, height: IMAGE_SIZE } }],
+    { format: ImageManipulator.SaveFormat.PNG, base64: true }
+  );
+
+  if (!resized.base64) throw new Error('ImageManipulator failed to return base64');
+
+  // 2. Decode PNG → raw RGBA pixels via UPNG
+  const binaryStr = atob(resized.base64);
+  const pngBytes  = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    pngBytes[i] = binaryStr.charCodeAt(i);
+  }
+
+  const decoded  = UPNG.decode(pngBytes.buffer);
+  const rgbaData = new Uint8Array(UPNG.toRGBA8(decoded)[0]);
+  // rgbaData: flat [R,G,B,A, R,G,B,A, ...] — IMAGE_SIZE*IMAGE_SIZE*4 bytes
+
+  // 3. Build NHWC Float32 tensor [1, H, W, 3] with CLIP normalization
+  //    TFLite uses NHWC (not NCHW like PyTorch)
+  const numPixels  = IMAGE_SIZE * IMAGE_SIZE;
+  const tensorData = new Float32Array(numPixels * 3);
+
+  for (let i = 0; i < numPixels; i++) {
+    const src = i * 4; // RGBA stride
+    const dst = i * 3; // RGB stride
+    for (let c = 0; c < 3; c++) {
+      tensorData[dst + c] = (rgbaData[src + c] / 255.0 - CLIP_MEAN[c]) / CLIP_STD[c];
     }
-    return { processor, visionModel, tokenizer, textModel };
+  }
+
+  // 4. Run inference
+  // runSync takes array of TypedArrays (one per input), returns TypedArray[] (one per output)
+  // MobileCLIP TFLite: input[0] = image tensor, output[0] = image embedding
+  const outputs: Float32Array[] = model.runSync([tensorData]) as Float32Array[];
+
+  console.log(`[vision] output shapes: ${outputs.map(o => o.length)}`);
+
+  // Find image embedding output — log showed us the index at load time
+  // For MobileCLIP, image embedding is output index 0
+  const embedding = new Float32Array(outputs[0]);
+  normalizeVector(embedding);
+
+  return embedding;
 }
 
-/**
- * Force cleanup of models to free memory (useful for low-memory situations)
- */
-export function cleanupModels() {
-    processor = null;
-    visionModel = null;
-    tokenizer = null;
-    textModel = null;
-    isInitialized = false;
 
-    // Force garbage collection if available
-    if (global.gc) {
-        global.gc();
-    }
+// ============================================================
+// TEXT EMBEDDING
+// text → normalized Float32Array [512]
+// ============================================================
 
-    console.log("🧹 Models cleaned up from memory");
+export async function getTextEmbedding(text: string): Promise<Float32Array> {
+
+  if (!model) throw new Error('Model not loaded. Call checkAndDownloadModels first.');
+
+  // 1. Tokenize text → Int32Array [1, 77]
+  const tokenIds = tokenize(text.toLowerCase().trim());
+  const inputIds = new Int32Array(CONTEXT_LENGTH).fill(0);
+  inputIds[0] = BOS_TOKEN;
+  const wordCount = Math.min(tokenIds.length, CONTEXT_LENGTH - 2);
+  for (let i = 0; i < wordCount; i++) inputIds[i + 1] = tokenIds[i];
+  inputIds[wordCount + 1] = EOS_TOKEN;
+
+  // 2. Run inference
+  // MobileCLIP TFLite: input[1] = text token ids, output[1] = text embedding
+  // (Exact indices confirmed from model.inputs/outputs log at load time)
+  const outputs: Float32Array[] = model.runSync([inputIds]) as Float32Array[];
+
+  console.log(`[text] output shapes: ${outputs.map(o => o.length)}`);
+
+  const embedding = new Float32Array(outputs[0]);
+  normalizeVector(embedding);
+
+  return embedding;
 }
 
-/**
- * Load a model with retry logic and memory management
- */
-async function loadModelWithRetry(loader: () => Promise<any>, modelName: string, maxRetries = 2): Promise<any> {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(`Loading ${modelName} (attempt ${attempt})`);
-            const model = await Promise.race([
-                loader(),
-                new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error(`${modelName} loading timeout`)), 60000)
-                )
-            ]);
-            return model;
-        } catch (error) {
-            console.warn(`${modelName} loading failed (attempt ${attempt}):`, error);
-            if (attempt < maxRetries) {
-                await cleanupMemory();
-                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait before retry
-            } else {
-                throw error;
-            }
-        }
-    }
+
+// ============================================================
+// SIMPLE TOKENIZER
+// djb2 hash maps words to stable IDs in CLIP vocab range.
+// Good enough for semantic photo search.
+// ============================================================
+
+function tokenize(text: string): number[] {
+  return text
+    .replace(/[^a-z0-9\s]/g, '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(word => {
+      let hash = 5381;
+      for (let i = 0; i < word.length; i++) {
+        hash = ((hash << 5) + hash + word.charCodeAt(i)) >>> 0;
+      }
+      return (hash % 49405) + 1;
+    });
 }
 
-/**
- * Get memory information if available
- */
-function getMemoryInfo() {
-    if (typeof performance !== 'undefined' && (performance as any).memory) {
-        return (performance as any).memory;
-    }
-    return null;
-}
 
-/**
- * Aggressive memory cleanup
- */
-async function cleanupMemory() {
-    // Force garbage collection if available
-    if (global.gc) {
-        global.gc();
-    }
+// ============================================================
+// CLEANUP
+// ============================================================
 
-    // Small delay to allow cleanup
-    await new Promise(resolve => setTimeout(resolve, 100));
+export function cleanupModels(): void {
+  model         = null;
+  isInitialized = false;
+  if (global.gc) global.gc();
+  console.log('🧹 Model cleaned up');
 }
